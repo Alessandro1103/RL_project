@@ -1,300 +1,689 @@
-import copy
-import time
+import math
+from abc import ABC, abstractmethod
 
-import numpy
-import ray
 import torch
 
-import models
 
-
-@ray.remote
-class Trainer:
-    """
-    Class which run in a dedicated thread to train a neural network and save it
-    in the shared storage.
-    """
-
-    def __init__(self, initial_checkpoint, config):
-        self.config = config
-
-        # Fix random generator seed
-        numpy.random.seed(self.config.seed)
-        torch.manual_seed(self.config.seed)
-
-        # Initialize the network
-        self.model = models.MuZeroNetwork(self.config)
-        self.model.set_weights(copy.deepcopy(initial_checkpoint["weights"]))
-        self.model.to(torch.device("cuda" if self.config.train_on_gpu else "cpu"))
-        self.model.train()
-
-        self.training_step = initial_checkpoint["training_step"]
-
-        if "cuda" not in str(next(self.model.parameters()).device):
-            print("You are not training on GPU.\n")
-
-        # Initialize the optimizer
-        if self.config.optimizer == "SGD":
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                lr=self.config.lr_init,
-                momentum=self.config.momentum,
-                weight_decay=self.config.weight_decay,
+class MuZeroNetwork:
+    def __new__(cls, config):
+        if config.network == "fullyconnected":
+            return MuZeroFullyConnectedNetwork(
+                config.observation_shape,
+                config.stacked_observations,
+                len(config.action_space),
+                config.encoding_size,
+                config.fc_reward_layers,
+                config.fc_value_layers,
+                config.fc_policy_layers,
+                config.fc_representation_layers,
+                config.fc_dynamics_layers,
+                config.support_size,
             )
-        elif self.config.optimizer == "Adam":
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(),
-                lr=self.config.lr_init,
-                weight_decay=self.config.weight_decay,
+        elif config.network == "resnet":
+            return MuZeroResidualNetwork(
+                config.observation_shape,
+                config.stacked_observations,
+                len(config.action_space),
+                config.blocks,
+                config.channels,
+                config.reduced_channels_reward,
+                config.reduced_channels_value,
+                config.reduced_channels_policy,
+                config.resnet_fc_reward_layers,
+                config.resnet_fc_value_layers,
+                config.resnet_fc_policy_layers,
+                config.support_size,
+                config.downsample,
             )
         else:
             raise NotImplementedError(
-                f"{self.config.optimizer} is not implemented. You can change the optimizer manually in trainer.py."
+                'The network parameter should be "fullyconnected" or "resnet".'
             )
 
-        if initial_checkpoint["optimizer_state"] is not None:
-            print("Loading optimizer...\n")
-            self.optimizer.load_state_dict(
-                copy.deepcopy(initial_checkpoint["optimizer_state"])
+
+def dict_to_cpu(dictionary):
+    cpu_dict = {}
+    for key, value in dictionary.items():
+        if isinstance(value, torch.Tensor):
+            cpu_dict[key] = value.cpu()
+        elif isinstance(value, dict):
+            cpu_dict[key] = dict_to_cpu(value)
+        else:
+            cpu_dict[key] = value
+    return cpu_dict
+
+
+class AbstractNetwork(ABC, torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        pass
+
+    @abstractmethod
+    def initial_inference(self, observation):
+        pass
+
+    @abstractmethod
+    def recurrent_inference(self, encoded_state, action):
+        pass
+
+    def get_weights(self):
+        return dict_to_cpu(self.state_dict())
+
+    def set_weights(self, weights):
+        self.load_state_dict(weights)
+
+
+##################################
+######## Fully Connected #########
+
+
+class MuZeroFullyConnectedNetwork(AbstractNetwork):
+    def __init__(
+        self,
+        observation_shape,
+        stacked_observations,
+        action_space_size,
+        encoding_size,
+        fc_reward_layers,
+        fc_value_layers,
+        fc_policy_layers,
+        fc_representation_layers,
+        fc_dynamics_layers,
+        support_size,
+    ):
+        super().__init__()
+        self.action_space_size = action_space_size
+        self.full_support_size = 2 * support_size + 1
+
+        self.representation_network = torch.nn.DataParallel(
+            mlp(
+                observation_shape[0]
+                * observation_shape[1]
+                * observation_shape[2]
+                * (stacked_observations + 1)
+                + stacked_observations * observation_shape[1] * observation_shape[2],
+                fc_representation_layers,
+                encoding_size,
             )
+        )
 
-    def continuous_update_weights(self, replay_buffer, shared_storage):
-        # Wait for the replay buffer to be filled
-        while ray.get(shared_storage.get_info.remote("num_played_games")) < 1:
-            time.sleep(0.1)
+        self.dynamics_encoded_state_network = torch.nn.DataParallel(
+            mlp(
+                encoding_size + self.action_space_size,
+                fc_dynamics_layers,
+                encoding_size,
+            )
+        )
+        self.dynamics_reward_network = torch.nn.DataParallel(
+            mlp(encoding_size, fc_reward_layers, self.full_support_size)
+        )
 
-        next_batch = replay_buffer.get_batch.remote()
-        # Training loop
-        while self.training_step < self.config.training_steps and not ray.get(
-            shared_storage.get_info.remote("terminate")
-        ):
-            index_batch, batch = ray.get(next_batch)
-            next_batch = replay_buffer.get_batch.remote()
-            self.update_lr()
+        self.prediction_policy_network = torch.nn.DataParallel(
+            mlp(encoding_size, fc_policy_layers, self.action_space_size)
+        )
+        self.prediction_value_network = torch.nn.DataParallel(
+            mlp(encoding_size, fc_value_layers, self.full_support_size)
+        )
+
+    def prediction(self, encoded_state):
+        policy_logits = self.prediction_policy_network(encoded_state)
+        value = self.prediction_value_network(encoded_state)
+        return policy_logits, value
+
+    def representation(self, observation):
+        encoded_state = self.representation_network(
+            observation.view(observation.shape[0], -1)
+        )
+        # Scale encoded state between [0, 1] (See appendix paper Training)
+        min_encoded_state = encoded_state.min(1, keepdim=True)[0]
+        max_encoded_state = encoded_state.max(1, keepdim=True)[0]
+        scale_encoded_state = max_encoded_state - min_encoded_state
+        scale_encoded_state[scale_encoded_state < 1e-5] += 1e-5
+        encoded_state_normalized = (
+            encoded_state - min_encoded_state
+        ) / scale_encoded_state
+        return encoded_state_normalized
+
+    def dynamics(self, encoded_state, action):
+        # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)
+        action_one_hot = (
+            torch.zeros((action.shape[0], self.action_space_size))
+            .to(action.device)
+            .float()
+        )
+        action_one_hot.scatter_(1, action.long(), 1.0)
+        x = torch.cat((encoded_state, action_one_hot), dim=1)
+
+        next_encoded_state = self.dynamics_encoded_state_network(x)
+
+        reward = self.dynamics_reward_network(next_encoded_state)
+
+        # Scale encoded state between [0, 1] (See paper appendix Training)
+        min_next_encoded_state = next_encoded_state.min(1, keepdim=True)[0]
+        max_next_encoded_state = next_encoded_state.max(1, keepdim=True)[0]
+        scale_next_encoded_state = max_next_encoded_state - min_next_encoded_state
+        scale_next_encoded_state[scale_next_encoded_state < 1e-5] += 1e-5
+        next_encoded_state_normalized = (
+            next_encoded_state - min_next_encoded_state
+        ) / scale_next_encoded_state
+
+        return next_encoded_state_normalized, reward
+
+    def initial_inference(self, observation):
+        encoded_state = self.representation(observation)
+        policy_logits, value = self.prediction(encoded_state)
+        # reward equal to 0 for consistency
+        reward = torch.log(
             (
-                priorities,
-                total_loss,
-                value_loss,
-                reward_loss,
-                policy_loss,
-            ) = self.update_weights(batch)
-
-            if self.config.PER:
-                # Save new priorities in the replay buffer (See https://arxiv.org/abs/1803.00933)
-                replay_buffer.update_priorities.remote(priorities, index_batch)
-
-            # Save to the shared storage
-            if self.training_step % self.config.checkpoint_interval == 0:
-                shared_storage.set_info.remote(
-                    {
-                        "weights": copy.deepcopy(self.model.get_weights()),
-                        "optimizer_state": copy.deepcopy(
-                            models.dict_to_cpu(self.optimizer.state_dict())
-                        ),
-                    }
-                )
-                if self.config.save_model:
-                    shared_storage.save_checkpoint.remote()
-            shared_storage.set_info.remote(
-                {
-                    "training_step": self.training_step,
-                    "lr": self.optimizer.param_groups[0]["lr"],
-                    "total_loss": total_loss,
-                    "value_loss": value_loss,
-                    "reward_loss": reward_loss,
-                    "policy_loss": policy_loss,
-                }
+                torch.zeros(1, self.full_support_size)
+                .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
+                .repeat(len(observation), 1)
+                .to(observation.device)
             )
-
-            # Managing the self-play / training ratio
-            if self.config.training_delay:
-                time.sleep(self.config.training_delay)
-            if self.config.ratio:
-                while (
-                    self.training_step
-                    / max(
-                        1, ray.get(shared_storage.get_info.remote("num_played_steps"))
-                    )
-                    > self.config.ratio
-                    and self.training_step < self.config.training_steps
-                    and not ray.get(shared_storage.get_info.remote("terminate"))
-                ):
-                    time.sleep(0.5)
-
-    def update_weights(self, batch):
-        """
-        Perform one training step.
-        """
-
-        (
-            observation_batch,
-            action_batch,
-            target_value,
-            target_reward,
-            target_policy,
-            weight_batch,
-            gradient_scale_batch,
-        ) = batch
-
-        # Keep values as scalars for calculating the priorities for the prioritized replay
-        target_value_scalar = numpy.array(target_value, dtype="float32")
-        priorities = numpy.zeros_like(target_value_scalar)
-
-        device = next(self.model.parameters()).device
-        if self.config.PER:
-            weight_batch = torch.tensor(weight_batch.copy()).float().to(device)
-        observation_batch = (
-            torch.tensor(numpy.array(observation_batch)).float().to(device)
         )
-        action_batch = torch.tensor(action_batch).long().to(device).unsqueeze(-1)
-        target_value = torch.tensor(target_value).float().to(device)
-        target_reward = torch.tensor(target_reward).float().to(device)
-        target_policy = torch.tensor(target_policy).float().to(device)
-        gradient_scale_batch = torch.tensor(gradient_scale_batch).float().to(device)
-        # observation_batch: batch, channels, height, width
-        # action_batch: batch, num_unroll_steps+1, 1 (unsqueeze)
-        # target_value: batch, num_unroll_steps+1
-        # target_reward: batch, num_unroll_steps+1
-        # target_policy: batch, num_unroll_steps+1, len(action_space)
-        # gradient_scale_batch: batch, num_unroll_steps+1
-
-        target_value = models.scalar_to_support(target_value, self.config.support_size)
-        target_reward = models.scalar_to_support(
-            target_reward, self.config.support_size
-        )
-        # target_value: batch, num_unroll_steps+1, 2*support_size+1
-        # target_reward: batch, num_unroll_steps+1, 2*support_size+1
-
-        ## Generate predictions
-        value, reward, policy_logits, hidden_state = self.model.initial_inference(
-            observation_batch
-        )
-        predictions = [(value, reward, policy_logits)]
-        for i in range(1, action_batch.shape[1]):
-            value, reward, policy_logits, hidden_state = self.model.recurrent_inference(
-                hidden_state, action_batch[:, i]
-            )
-            # Scale the gradient at the start of the dynamics function (See paper appendix Training)
-            hidden_state.register_hook(lambda grad: grad * 0.5)
-            predictions.append((value, reward, policy_logits))
-        # predictions: num_unroll_steps+1, 3, batch, 2*support_size+1 | 2*support_size+1 | 9 (according to the 2nd dim)
-
-        ## Compute losses
-        value_loss, reward_loss, policy_loss = (0, 0, 0)
-        value, reward, policy_logits = predictions[0]
-        # Ignore reward loss for the first batch step
-        current_value_loss, _, current_policy_loss = self.loss_function(
-            value.squeeze(-1),
-            reward.squeeze(-1),
-            policy_logits,
-            target_value[:, 0],
-            target_reward[:, 0],
-            target_policy[:, 0],
-        )
-        value_loss += current_value_loss
-        policy_loss += current_policy_loss
-        # Compute priorities for the prioritized replay (See paper appendix Training)
-        pred_value_scalar = (
-            models.support_to_scalar(value, self.config.support_size)
-            .detach()
-            .cpu()
-            .numpy()
-            .squeeze()
-        )
-        priorities[:, 0] = (
-            numpy.abs(pred_value_scalar - target_value_scalar[:, 0])
-            ** self.config.PER_alpha
-        )
-
-        for i in range(1, len(predictions)):
-            value, reward, policy_logits = predictions[i]
-            (
-                current_value_loss,
-                current_reward_loss,
-                current_policy_loss,
-            ) = self.loss_function(
-                value.squeeze(-1),
-                reward.squeeze(-1),
-                policy_logits,
-                target_value[:, i],
-                target_reward[:, i],
-                target_policy[:, i],
-            )
-
-            # Scale gradient by the number of unroll steps (See paper appendix Training)
-            current_value_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            current_reward_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            current_policy_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-
-            value_loss += current_value_loss
-            reward_loss += current_reward_loss
-            policy_loss += current_policy_loss
-
-            # Compute priorities for the prioritized replay (See paper appendix Training)
-            pred_value_scalar = (
-                models.support_to_scalar(value, self.config.support_size)
-                .detach()
-                .cpu()
-                .numpy()
-                .squeeze()
-            )
-            priorities[:, i] = (
-                numpy.abs(pred_value_scalar - target_value_scalar[:, i])
-                ** self.config.PER_alpha
-            )
-
-        # Scale the value loss, paper recommends by 0.25 (See paper appendix Reanalyze)
-        loss = value_loss * self.config.value_loss_weight + reward_loss + policy_loss
-        if self.config.PER:
-            # Correct PER bias by using importance-sampling (IS) weights
-            loss *= weight_batch
-        # Mean over batch dimension (pseudocode do a sum)
-        loss = loss.mean()
-
-        # Optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()
-        self.training_step += 1
 
         return (
-            priorities,
-            # For log purpose
-            loss.item(),
-            value_loss.mean().item(),
-            reward_loss.mean().item(),
-            policy_loss.mean().item(),
+            value,
+            reward,
+            policy_logits,
+            encoded_state,
         )
 
-    def update_lr(self):
-        """
-        Update learning rate
-        """
-        lr = self.config.lr_init * self.config.lr_decay_rate ** (
-            self.training_step / self.config.lr_decay_steps
-        )
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+    def recurrent_inference(self, encoded_state, action):
+        next_encoded_state, reward = self.dynamics(encoded_state, action)
+        policy_logits, value = self.prediction(next_encoded_state)
+        return value, reward, policy_logits, next_encoded_state
 
-    @staticmethod
-    def loss_function(
-        value,
-        reward,
-        policy_logits,
-        target_value,
-        target_reward,
-        target_policy,
+
+###### End Fully Connected #######
+##################################
+
+
+##################################
+############# ResNet #############
+
+
+def conv3x3(in_channels, out_channels, stride=1):
+    return torch.nn.Conv2d(
+        in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False
+    )
+
+
+# Residual block
+class ResidualBlock(torch.nn.Module):
+    def __init__(self, num_channels, stride=1):
+        super().__init__()
+        self.conv1 = conv3x3(num_channels, num_channels, stride)
+        self.bn1 = torch.nn.BatchNorm2d(num_channels)
+        self.conv2 = conv3x3(num_channels, num_channels)
+        self.bn2 = torch.nn.BatchNorm2d(num_channels)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = torch.nn.functional.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out += x
+        out = torch.nn.functional.relu(out)
+        return out
+
+
+# Downsample observations before representation network (See paper appendix Network Architecture)
+class DownSample(torch.nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = torch.nn.Conv2d(
+            in_channels,
+            out_channels // 2,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+        self.resblocks1 = torch.nn.ModuleList(
+            [ResidualBlock(out_channels // 2) for _ in range(2)]
+        )
+        self.conv2 = torch.nn.Conv2d(
+            out_channels // 2,
+            out_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
+        self.resblocks2 = torch.nn.ModuleList(
+            [ResidualBlock(out_channels) for _ in range(3)]
+        )
+        self.pooling1 = torch.nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
+        self.resblocks3 = torch.nn.ModuleList(
+            [ResidualBlock(out_channels) for _ in range(3)]
+        )
+        self.pooling2 = torch.nn.AvgPool2d(kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        for block in self.resblocks1:
+            x = block(x)
+        x = self.conv2(x)
+        for block in self.resblocks2:
+            x = block(x)
+        x = self.pooling1(x)
+        for block in self.resblocks3:
+            x = block(x)
+        x = self.pooling2(x)
+        return x
+
+
+class DownsampleCNN(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, h_w):
+        super().__init__()
+        mid_channels = (in_channels + out_channels) // 2
+        self.features = torch.nn.Sequential(
+            torch.nn.Conv2d(
+                in_channels, mid_channels, kernel_size=h_w[0] * 2, stride=4, padding=2
+            ),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(kernel_size=3, stride=2),
+            torch.nn.Conv2d(mid_channels, out_channels, kernel_size=5, padding=2),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.MaxPool2d(kernel_size=3, stride=2),
+        )
+        self.avgpool = torch.nn.AdaptiveAvgPool2d(h_w)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        return x
+
+
+class RepresentationNetwork(torch.nn.Module):
+    def __init__(
+        self,
+        observation_shape,
+        stacked_observations,
+        num_blocks,
+        num_channels,
+        downsample,
     ):
-        # Cross-entropy seems to have a better convergence than MSE
-        value_loss = (-target_value * torch.nn.LogSoftmax(dim=1)(value)).sum(1)
-        reward_loss = (-target_reward * torch.nn.LogSoftmax(dim=1)(reward)).sum(1)
-        policy_loss = (-target_policy * torch.nn.LogSoftmax(dim=1)(policy_logits)).sum(
-            1
+        super().__init__()
+        self.downsample = downsample
+        if self.downsample:
+            if self.downsample == "resnet":
+                self.downsample_net = DownSample(
+                    observation_shape[0] * (stacked_observations + 1)
+                    + stacked_observations,
+                    num_channels,
+                )
+            elif self.downsample == "CNN":
+                self.downsample_net = DownsampleCNN(
+                    observation_shape[0] * (stacked_observations + 1)
+                    + stacked_observations,
+                    num_channels,
+                    (
+                        math.ceil(observation_shape[1] / 16),
+                        math.ceil(observation_shape[2] / 16),
+                    ),
+                )
+            else:
+                raise NotImplementedError('downsample should be "resnet" or "CNN".')
+        self.conv = conv3x3(
+            observation_shape[0] * (stacked_observations + 1) + stacked_observations,
+            num_channels,
         )
-        return value_loss, reward_loss, policy_loss
+        self.bn = torch.nn.BatchNorm2d(num_channels)
+        self.resblocks = torch.nn.ModuleList(
+            [ResidualBlock(num_channels) for _ in range(num_blocks)]
+        )
+
+    def forward(self, x):
+        if self.downsample:
+            x = self.downsample_net(x)
+        else:
+            x = self.conv(x)
+            x = self.bn(x)
+            x = torch.nn.functional.relu(x)
+
+        for block in self.resblocks:
+            x = block(x)
+        return x
+
+
+class DynamicsNetwork(torch.nn.Module):
+    def __init__(
+        self,
+        num_blocks,
+        num_channels,
+        reduced_channels_reward,
+        fc_reward_layers,
+        full_support_size,
+        block_output_size_reward,
+    ):
+        super().__init__()
+        self.conv = conv3x3(num_channels, num_channels - 1)
+        self.bn = torch.nn.BatchNorm2d(num_channels - 1)
+        self.resblocks = torch.nn.ModuleList(
+            [ResidualBlock(num_channels - 1) for _ in range(num_blocks)]
+        )
+
+        self.conv1x1_reward = torch.nn.Conv2d(
+            num_channels - 1, reduced_channels_reward, 1
+        )
+        self.block_output_size_reward = block_output_size_reward
+        self.fc = mlp(
+            self.block_output_size_reward,
+            fc_reward_layers,
+            full_support_size,
+        )
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = torch.nn.functional.relu(x)
+        for block in self.resblocks:
+            x = block(x)
+        state = x
+        x = self.conv1x1_reward(x)
+        x = x.view(-1, self.block_output_size_reward)
+        reward = self.fc(x)
+        return state, reward
+
+
+class PredictionNetwork(torch.nn.Module):
+    def __init__(
+        self,
+        action_space_size,
+        num_blocks,
+        num_channels,
+        reduced_channels_value,
+        reduced_channels_policy,
+        fc_value_layers,
+        fc_policy_layers,
+        full_support_size,
+        block_output_size_value,
+        block_output_size_policy,
+    ):
+        super().__init__()
+        self.resblocks = torch.nn.ModuleList(
+            [ResidualBlock(num_channels) for _ in range(num_blocks)]
+        )
+
+        self.conv1x1_value = torch.nn.Conv2d(num_channels, reduced_channels_value, 1)
+        self.conv1x1_policy = torch.nn.Conv2d(num_channels, reduced_channels_policy, 1)
+        self.block_output_size_value = block_output_size_value
+        self.block_output_size_policy = block_output_size_policy
+        self.fc_value = mlp(
+            self.block_output_size_value, fc_value_layers, full_support_size
+        )
+        self.fc_policy = mlp(
+            self.block_output_size_policy,
+            fc_policy_layers,
+            action_space_size,
+        )
+
+    def forward(self, x):
+        for block in self.resblocks:
+            x = block(x)
+        value = self.conv1x1_value(x)
+        policy = self.conv1x1_policy(x)
+        value = value.view(-1, self.block_output_size_value)
+        policy = policy.view(-1, self.block_output_size_policy)
+        value = self.fc_value(value)
+        policy = self.fc_policy(policy)
+        return policy, value
+
+
+class MuZeroResidualNetwork(AbstractNetwork):
+    def __init__(
+        self,
+        observation_shape,
+        stacked_observations,
+        action_space_size,
+        num_blocks,
+        num_channels,
+        reduced_channels_reward,
+        reduced_channels_value,
+        reduced_channels_policy,
+        fc_reward_layers,
+        fc_value_layers,
+        fc_policy_layers,
+        support_size,
+        downsample,
+    ):
+        super().__init__()
+        self.action_space_size = action_space_size
+        self.full_support_size = 2 * support_size + 1
+        block_output_size_reward = (
+            (
+                reduced_channels_reward
+                * math.ceil(observation_shape[1] / 16)
+                * math.ceil(observation_shape[2] / 16)
+            )
+            if downsample
+            else (reduced_channels_reward * observation_shape[1] * observation_shape[2])
+        )
+
+        block_output_size_value = (
+            (
+                reduced_channels_value
+                * math.ceil(observation_shape[1] / 16)
+                * math.ceil(observation_shape[2] / 16)
+            )
+            if downsample
+            else (reduced_channels_value * observation_shape[1] * observation_shape[2])
+        )
+
+        block_output_size_policy = (
+            (
+                reduced_channels_policy
+                * math.ceil(observation_shape[1] / 16)
+                * math.ceil(observation_shape[2] / 16)
+            )
+            if downsample
+            else (reduced_channels_policy * observation_shape[1] * observation_shape[2])
+        )
+
+        self.representation_network = torch.nn.DataParallel(
+            RepresentationNetwork(
+                observation_shape,
+                stacked_observations,
+                num_blocks,
+                num_channels,
+                downsample,
+            )
+        )
+
+        self.dynamics_network = torch.nn.DataParallel(
+            DynamicsNetwork(
+                num_blocks,
+                num_channels + 1,
+                reduced_channels_reward,
+                fc_reward_layers,
+                self.full_support_size,
+                block_output_size_reward,
+            )
+        )
+
+        self.prediction_network = torch.nn.DataParallel(
+            PredictionNetwork(
+                action_space_size,
+                num_blocks,
+                num_channels,
+                reduced_channels_value,
+                reduced_channels_policy,
+                fc_value_layers,
+                fc_policy_layers,
+                self.full_support_size,
+                block_output_size_value,
+                block_output_size_policy,
+            )
+        )
+
+    def prediction(self, encoded_state):
+        policy, value = self.prediction_network(encoded_state)
+        return policy, value
+
+    def representation(self, observation):
+        encoded_state = self.representation_network(observation)
+
+        # Scale encoded state between [0, 1] (See appendix paper Training)
+        min_encoded_state = (
+            encoded_state.view(
+                -1,
+                encoded_state.shape[1],
+                encoded_state.shape[2] * encoded_state.shape[3],
+            )
+            .min(2, keepdim=True)[0]
+            .unsqueeze(-1)
+        )
+        max_encoded_state = (
+            encoded_state.view(
+                -1,
+                encoded_state.shape[1],
+                encoded_state.shape[2] * encoded_state.shape[3],
+            )
+            .max(2, keepdim=True)[0]
+            .unsqueeze(-1)
+        )
+        scale_encoded_state = max_encoded_state - min_encoded_state
+        scale_encoded_state[scale_encoded_state < 1e-5] += 1e-5
+        encoded_state_normalized = (
+            encoded_state - min_encoded_state
+        ) / scale_encoded_state
+        return encoded_state_normalized
+
+    def dynamics(self, encoded_state, action):
+        # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)
+        action_one_hot = (
+            torch.ones(
+                (
+                    encoded_state.shape[0],
+                    1,
+                    encoded_state.shape[2],
+                    encoded_state.shape[3],
+                )
+            )
+            .to(action.device)
+            .float()
+        )
+        action_one_hot = (
+            action[:, :, None, None] * action_one_hot / self.action_space_size
+        )
+        x = torch.cat((encoded_state, action_one_hot), dim=1)
+        next_encoded_state, reward = self.dynamics_network(x)
+
+        # Scale encoded state between [0, 1] (See paper appendix Training)
+        min_next_encoded_state = (
+            next_encoded_state.view(
+                -1,
+                next_encoded_state.shape[1],
+                next_encoded_state.shape[2] * next_encoded_state.shape[3],
+            )
+            .min(2, keepdim=True)[0]
+            .unsqueeze(-1)
+        )
+        max_next_encoded_state = (
+            next_encoded_state.view(
+                -1,
+                next_encoded_state.shape[1],
+                next_encoded_state.shape[2] * next_encoded_state.shape[3],
+            )
+            .max(2, keepdim=True)[0]
+            .unsqueeze(-1)
+        )
+        scale_next_encoded_state = max_next_encoded_state - min_next_encoded_state
+        scale_next_encoded_state[scale_next_encoded_state < 1e-5] += 1e-5
+        next_encoded_state_normalized = (
+            next_encoded_state - min_next_encoded_state
+        ) / scale_next_encoded_state
+        return next_encoded_state_normalized, reward
+
+    def initial_inference(self, observation):
+        encoded_state = self.representation(observation)
+        policy_logits, value = self.prediction(encoded_state)
+        # reward equal to 0 for consistency
+        reward = torch.log(
+            (
+                torch.zeros(1, self.full_support_size)
+                .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
+                .repeat(len(observation), 1)
+                .to(observation.device)
+            )
+        )
+        return (
+            value,
+            reward,
+            policy_logits,
+            encoded_state,
+        )
+
+    def recurrent_inference(self, encoded_state, action):
+        next_encoded_state, reward = self.dynamics(encoded_state, action)
+        policy_logits, value = self.prediction(next_encoded_state)
+        return value, reward, policy_logits, next_encoded_state
+
+
+########### End ResNet ###########
+##################################
+
+
+def mlp(
+    input_size,
+    layer_sizes,
+    output_size,
+    output_activation=torch.nn.Identity,
+    activation=torch.nn.ELU,
+):
+    sizes = [input_size] + layer_sizes + [output_size]
+    layers = []
+    for i in range(len(sizes) - 1):
+        act = activation if i < len(sizes) - 2 else output_activation
+        layers += [torch.nn.Linear(sizes[i], sizes[i + 1]), act()]
+    return torch.nn.Sequential(*layers)
+
+
+def support_to_scalar(logits, support_size):
+    """
+    Transform a categorical representation to a scalar
+    See paper appendix Network Architecture
+    """
+    # Decode to a scalar
+    probabilities = torch.softmax(logits, dim=1)
+    support = (
+        torch.tensor([x for x in range(-support_size, support_size + 1)])
+        .expand(probabilities.shape)
+        .float()
+        .to(device=probabilities.device)
+    )
+    x = torch.sum(support * probabilities, dim=1, keepdim=True)
+
+    # Invert the scaling (defined in https://arxiv.org/abs/1805.11593)
+    x = torch.sign(x) * (
+        ((torch.sqrt(1 + 4 * 0.001 * (torch.abs(x) + 1 + 0.001)) - 1) / (2 * 0.001))
+        ** 2
+        - 1
+    )
+    return x
+
+
+def scalar_to_support(x, support_size):
+    """
+    Transform a scalar to a categorical representation with (2 * support_size + 1) categories
+    See paper appendix Network Architecture
+    """
+    # Reduce the scale (defined in https://arxiv.org/abs/1805.11593)
+    x = torch.sign(x) * (torch.sqrt(torch.abs(x) + 1) - 1) + 0.001 * x
+
+    # Encode on a vector
+    x = torch.clamp(x, -support_size, support_size)
+    floor = x.floor()
+    prob = x - floor
+    logits = torch.zeros(x.shape[0], x.shape[1], 2 * support_size + 1).to(x.device)
+    logits.scatter_(
+        2, (floor + support_size).long().unsqueeze(-1), (1 - prob).unsqueeze(-1)
+    )
+    indexes = floor + support_size + 1
+    prob = prob.masked_fill_(2 * support_size < indexes, 0.0)
+    indexes = indexes.masked_fill_(2 * support_size < indexes, 0.0)
+    logits.scatter_(2, indexes.long().unsqueeze(-1), prob.unsqueeze(-1))
+    return logits
