@@ -349,6 +349,54 @@ class RepresentationNetwork(torch.nn.Module):
         return x
 
 
+class ReconstructionNetwork(torch.nn.Module):
+    def __init__(self, observation_shape, stacked_observations, num_blocks, num_channels, downsample):
+        super().__init__()
+        self.downsample = downsample
+        
+        self.resblocks = torch.nn.ModuleList(
+            [ResidualBlock(num_channels) for _ in range(num_blocks)]
+        )
+
+        if self.downsample:
+            output_channels = observation_shape[0] * (stacked_observations + 1)
+            mid_channels = num_channels // 2 
+            
+            self.upsample_net = torch.nn.Sequential(
+                torch.nn.Upsample(scale_factor=2, mode='nearest'),
+                conv3x3(num_channels, mid_channels),
+                torch.nn.BatchNorm2d(mid_channels),
+                torch.nn.ReLU(),
+                
+                torch.nn.Upsample(scale_factor=2, mode='nearest'),
+                conv3x3(mid_channels, mid_channels),
+                torch.nn.BatchNorm2d(mid_channels),
+                torch.nn.ReLU(),
+                
+                torch.nn.Upsample(scale_factor=2, mode='nearest'),
+                conv3x3(mid_channels, mid_channels),
+                torch.nn.BatchNorm2d(mid_channels),
+                torch.nn.ReLU(),
+
+                torch.nn.Upsample(scale_factor=2, mode='nearest'),
+                conv3x3(mid_channels, mid_channels),
+                torch.nn.BatchNorm2d(mid_channels),
+                torch.nn.ReLU(),
+                
+                torch.nn.Conv2d(mid_channels, output_channels, kernel_size=3, padding=1)
+            )
+
+    def forward(self, x):
+
+        for block in self.resblocks:
+            x = block(x)
+        
+        if self.downsample:
+            x = self.upsample_net(x)
+            
+        return x
+
+
 class DynamicsNetwork(torch.nn.Module):
     def __init__(
         self,
@@ -493,6 +541,16 @@ class MuZeroResidualNetwork(AbstractNetwork):
             )
         )
 
+        self.reconstruction_network = torch.nn.DataParallel(
+            ReconstructionNetwork(
+                observation_shape,
+                stacked_observations,
+                num_blocks,
+                num_channels,
+                downsample,
+            )
+        )
+
         self.dynamics_network = torch.nn.DataParallel(
             DynamicsNetwork(
                 num_blocks,
@@ -552,6 +610,10 @@ class MuZeroResidualNetwork(AbstractNetwork):
         ) / scale_encoded_state
         return encoded_state_normalized
 
+    def reconstruction(self, encoded_state):
+        reconstructed_observation = self.reconstruction_network(encoded_state)
+        return reconstructed_observation
+
     def dynamics(self, encoded_state, action):
         # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)
         action_one_hot = (
@@ -600,6 +662,7 @@ class MuZeroResidualNetwork(AbstractNetwork):
 
     def initial_inference(self, observation):
         encoded_state = self.representation(observation)
+        reconstructed_observation = self.reconstruction(encoded_state)
         policy_logits, value = self.prediction(encoded_state)
         # reward equal to 0 for consistency
         reward = torch.log(
@@ -615,13 +678,20 @@ class MuZeroResidualNetwork(AbstractNetwork):
             reward,
             policy_logits,
             encoded_state,
+            reconstructed_observation
         )
 
     def recurrent_inference(self, encoded_state, action):
         next_encoded_state, reward = self.dynamics(encoded_state, action)
+        next_reconstruction = self.reconstruction(next_encoded_state)
         policy_logits, value = self.prediction(next_encoded_state)
-        return value, reward, policy_logits, next_encoded_state
-
+        return (
+            value, 
+            reward, 
+            policy_logits, 
+            next_encoded_state, 
+            next_reconstruction
+        )
 
 ########### End ResNet ###########
 ##################################

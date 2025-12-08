@@ -134,6 +134,7 @@ class Trainer:
             target_policy,
             weight_batch,
             gradient_scale_batch,
+            target_observations,
         ) = batch
 
         # Keep values as scalars for calculating the priorities for the prioritized replay
@@ -151,12 +152,14 @@ class Trainer:
         target_reward = torch.tensor(target_reward).float().to(device)
         target_policy = torch.tensor(target_policy).float().to(device)
         gradient_scale_batch = torch.tensor(gradient_scale_batch).float().to(device)
+        target_observations = torch.tensor(numpy.array(target_observations)).float().to(device)
         # observation_batch: batch, channels, height, width
         # action_batch: batch, num_unroll_steps+1, 1 (unsqueeze)
         # target_value: batch, num_unroll_steps+1
         # target_reward: batch, num_unroll_steps+1
         # target_policy: batch, num_unroll_steps+1, len(action_space)
         # gradient_scale_batch: batch, num_unroll_steps+1
+        # target_observations: batch, num_unroll_steps+1, channels, height, width
 
         target_value = models.scalar_to_support(target_value, self.config.support_size)
         target_reward = models.scalar_to_support(
@@ -166,22 +169,22 @@ class Trainer:
         # target_reward: batch, num_unroll_steps+1, 2*support_size+1
 
         ## Generate predictions
-        value, reward, policy_logits, hidden_state = self.model.initial_inference(
+        value, reward, policy_logits, hidden_state, reconstruction = self.model.initial_inference(
             observation_batch
         )
-        predictions = [(value, reward, policy_logits)]
+        predictions = [(value, reward, policy_logits, reconstruction)]
         for i in range(1, action_batch.shape[1]):
-            value, reward, policy_logits, hidden_state = self.model.recurrent_inference(
+            value, reward, policy_logits, hidden_state, reconstruction = self.model.recurrent_inference(
                 hidden_state, action_batch[:, i]
             )
             # Scale the gradient at the start of the dynamics function (See paper appendix Training)
             hidden_state.register_hook(lambda grad: grad * 0.5)
-            predictions.append((value, reward, policy_logits))
+            predictions.append((value, reward, policy_logits, reconstruction))
         # predictions: num_unroll_steps+1, 3, batch, 2*support_size+1 | 2*support_size+1 | 9 (according to the 2nd dim)
 
         ## Compute losses
         value_loss, reward_loss, policy_loss = (0, 0, 0)
-        value, reward, policy_logits = predictions[0]
+        value, reward, policy_logits, reconstruction = predictions[0]
         # Ignore reward loss for the first batch step
         current_value_loss, _, current_policy_loss = self.loss_function(
             value.squeeze(-1),
@@ -193,6 +196,12 @@ class Trainer:
         )
         value_loss += current_value_loss
         policy_loss += current_policy_loss
+
+        current_reconstruction_loss = torch.nn.functional.mse_loss(
+            reconstruction, target_observations[:, 0]
+        )
+        reconstruction_loss += current_reconstruction_loss
+
         # Compute priorities for the prioritized replay (See paper appendix Training)
         pred_value_scalar = (
             models.support_to_scalar(value, self.config.support_size)
@@ -207,7 +216,7 @@ class Trainer:
         )
 
         for i in range(1, len(predictions)):
-            value, reward, policy_logits = predictions[i]
+            value, reward, policy_logits, reconstruction = predictions[i]
             (
                 current_value_loss,
                 current_reward_loss,
@@ -236,6 +245,16 @@ class Trainer:
             reward_loss += current_reward_loss
             policy_loss += current_policy_loss
 
+            current_reconstruction_loss = torch.nn.functional.mse_loss(
+                reconstruction, target_observations[:, i]
+            )
+            
+            current_reconstruction_loss.register_hook(
+                lambda grad: grad / gradient_scale_batch[:, i]
+            )
+            
+            reconstruction_loss += current_reconstruction_loss
+
             # Compute priorities for the prioritized replay (See paper appendix Training)
             pred_value_scalar = (
                 models.support_to_scalar(value, self.config.support_size)
@@ -250,7 +269,13 @@ class Trainer:
             )
 
         # Scale the value loss, paper recommends by 0.25 (See paper appendix Reanalyze)
-        loss = value_loss * self.config.value_loss_weight + reward_loss + policy_loss
+        loss = (
+            value_loss * self.config.value_loss_weight 
+            + reward_loss 
+            + policy_loss 
+            + reconstruction_loss * self.config.reconstruction_loss_weight
+        )
+        
         if self.config.PER:
             # Correct PER bias by using importance-sampling (IS) weights
             loss *= weight_batch

@@ -76,7 +76,8 @@ class ReplayBuffer:
             value_batch,
             policy_batch,
             gradient_scale_batch,
-        ) = ([], [], [], [], [], [], [])
+            target_observations_batch
+        ) = ([], [], [], [], [], [], [], [])
         weight_batch = [] if self.config.PER else None
 
         for game_id, game_history, game_prob in self.sample_n_games(
@@ -96,6 +97,27 @@ class ReplayBuffer:
                     len(self.config.action_space),
                 )
             )
+
+            targets = []
+            for i in range(self.config.num_unroll_steps + 1):
+                target_index = game_pos + i
+                
+                if target_index < len(game_history.root_values):
+                    obs = game_history.get_stacked_observations(
+                        target_index,
+                        self.config.stacked_observations,
+                        len(self.config.action_space),
+                    )
+                else:
+                    obs = game_history.get_stacked_observations(
+                        len(game_history.root_values) - 1,
+                        self.config.stacked_observations,
+                        len(self.config.action_space),
+                    )
+                targets.append(obs)
+            
+            target_observations_batch.append(targets)
+
             action_batch.append(actions)
             value_batch.append(values)
             reward_batch.append(rewards)
@@ -134,6 +156,7 @@ class ReplayBuffer:
                 policy_batch,
                 weight_batch,
                 gradient_scale_batch,
+                target_observations_batch,
             ),
         )
 
