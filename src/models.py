@@ -16,6 +16,7 @@ class MuZeroNetwork:
                 config.fc_value_layers,
                 config.fc_policy_layers,
                 config.fc_representation_layers,
+                config.fc_reconstruction_layers,
                 config.fc_dynamics_layers,
                 config.support_size,
             )
@@ -88,22 +89,30 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         fc_value_layers,
         fc_policy_layers,
         fc_representation_layers,
+        fc_reconstruction_layers,
         fc_dynamics_layers,
         support_size,
     ):
         super().__init__()
         self.action_space_size = action_space_size
         self.full_support_size = 2 * support_size + 1
+        self.observation_shape = observation_shape
+        self.stacked_observations = stacked_observations
+        input_size = observation_shape[0] * observation_shape[1] * observation_shape[2] * (stacked_observations + 1)
 
         self.representation_network = torch.nn.DataParallel(
             mlp(
-                observation_shape[0]
-                * observation_shape[1]
-                * observation_shape[2]
-                * (stacked_observations + 1)
-                + stacked_observations * observation_shape[1] * observation_shape[2],
+                input_size,
                 fc_representation_layers,
                 encoding_size,
+            )
+        )
+
+        self.reconstruction_network = torch.nn.DataParallel(
+            mlp(
+                encoding_size,
+                fc_reconstruction_layers,
+                input_size,
             )
         )
 
@@ -144,6 +153,10 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         ) / scale_encoded_state
         return encoded_state_normalized
 
+    def reconstruction(self, encoded_state):
+        reconstructed_flat = self.reconstruction_network(encoded_state)
+        return reconstructed_flat.view(-1, *self.observation_shape)
+
     def dynamics(self, encoded_state, action):
         # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)
         action_one_hot = (
@@ -170,7 +183,8 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
         return next_encoded_state_normalized, reward
 
     def initial_inference(self, observation):
-        encoded_state = self.representation(observation)
+        encoded_state = self.representation(observation)  
+        reconstructed_observation = self.reconstruction(encoded_state)  
         policy_logits, value = self.prediction(encoded_state)
         # reward equal to 0 for consistency
         reward = torch.log(
@@ -187,13 +201,21 @@ class MuZeroFullyConnectedNetwork(AbstractNetwork):
             reward,
             policy_logits,
             encoded_state,
+            reconstructed_observation,
         )
 
     def recurrent_inference(self, encoded_state, action):
         next_encoded_state, reward = self.dynamics(encoded_state, action)
+        next_reconstruction = self.reconstruction(next_encoded_state)
         policy_logits, value = self.prediction(next_encoded_state)
-        return value, reward, policy_logits, next_encoded_state
-
+        
+        return (
+            value, 
+            reward, 
+            policy_logits, 
+            next_encoded_state, 
+            next_reconstruction,
+        )
 
 ###### End Fully Connected #######
 ##################################
@@ -611,8 +633,8 @@ class MuZeroResidualNetwork(AbstractNetwork):
         return encoded_state_normalized
 
     def reconstruction(self, encoded_state):
-        reconstructed_observation = self.reconstruction_network(encoded_state)
-        return reconstructed_observation
+        reconstructed_flat = self.reconstruction_network(encoded_state)
+        return reconstructed_flat.view(-1, *self.observation_shape)
 
     def dynamics(self, encoded_state, action):
         # Stack encoded_state with a game specific one hot encoded action (See paper appendix Network Architecture)

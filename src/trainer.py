@@ -192,20 +192,6 @@ class Trainer:
             value, reward, policy_logits, hidden_state, reconstruction = self.model.recurrent_inference(
                 hidden_state, action_batch[:, i]
             )
-                            
-            current_state_flat = hidden_state.view(batch_size, -1)
-
-            target_state_flat = target_latent_states[:, i]
-            
-            current_consistency_loss = torch.nn.functional.mse_loss(
-                current_state_flat, target_state_flat
-            )
-
-            current_consistency_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
-            )
-            
-            consistency_loss += current_consistency_loss
 
             # Scale the gradient at the start of the dynamics function (See paper appendix Training)
             hidden_state.register_hook(lambda grad: grad * 0.5)
@@ -213,8 +199,8 @@ class Trainer:
         # predictions: num_unroll_steps+1, 3, batch, 2*support_size+1 | 2*support_size+1 | 9 (according to the 2nd dim)
 
         ## Compute losses
-        value_loss, reward_loss, policy_loss = (0, 0, 0)
-        value, reward, policy_logits, reconstruction = predictions[0]
+        value_loss, reward_loss, policy_loss, reconstruction_loss, consistency_loss = (0, 0, 0, 0, 0)
+        value, reward, policy_logits, reconstruction, _ = predictions[0]
         # Ignore reward loss for the first batch step
         current_value_loss, _, current_policy_loss = self.loss_function(
             value.squeeze(-1),
@@ -246,7 +232,7 @@ class Trainer:
         )
 
         for i in range(1, len(predictions)):
-            value, reward, policy_logits, reconstruction = predictions[i]
+            value, reward, policy_logits, reconstruction, current_hidden_state = predictions[i]
             (
                 current_value_loss,
                 current_reward_loss,
@@ -261,14 +247,16 @@ class Trainer:
             )
 
             # Scale gradient by the number of unroll steps (See paper appendix Training)
+            scale = gradient_scale_batch[:, i].view(-1, 1)
+            
             current_value_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
+                lambda grad, s=scale: grad / s
             )
             current_reward_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
+                lambda grad, s=scale: grad / s
             )
             current_policy_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
+                lambda grad, s=scale: grad / s
             )
 
             value_loss += current_value_loss
@@ -280,10 +268,21 @@ class Trainer:
             )
             
             current_reconstruction_loss.register_hook(
-                lambda grad: grad / gradient_scale_batch[:, i]
+                lambda grad, s=scale: grad / s
             )
             
             reconstruction_loss += current_reconstruction_loss
+
+            current_state_flat = current_hidden_state.view(batch_size, -1)
+            target_state_flat = target_latent_states[:, i]
+            
+            current_consistency_loss = torch.nn.functional.mse_loss(
+                current_state_flat, target_state_flat
+            )
+            current_consistency_loss.register_hook(
+                lambda grad, s=scale: grad / s
+            )
+            consistency_loss += current_consistency_loss
 
             # Compute priorities for the prioritized replay (See paper appendix Training)
             pred_value_scalar = (
