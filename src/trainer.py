@@ -160,6 +160,21 @@ class Trainer:
         # target_policy: batch, num_unroll_steps+1, len(action_space)
         # gradient_scale_batch: batch, num_unroll_steps+1
         # target_observations: batch, num_unroll_steps+1, channels, height, width
+    
+        batch_size, num_unroll_plus_1, C, H, W = target_observations.shape
+        
+        target_observations_flat = target_observations.view(
+            batch_size * num_unroll_plus_1, C, H, W
+        )
+        
+        with torch.no_grad():
+            target_latent_states_flat = self.model.representation(
+                target_observations_flat
+            )
+        
+        target_latent_states = target_latent_states_flat.view(
+            batch_size, num_unroll_plus_1, -1
+        )
 
         target_value = models.scalar_to_support(target_value, self.config.support_size)
         target_reward = models.scalar_to_support(
@@ -172,14 +187,29 @@ class Trainer:
         value, reward, policy_logits, hidden_state, reconstruction = self.model.initial_inference(
             observation_batch
         )
-        predictions = [(value, reward, policy_logits, reconstruction)]
+        predictions = [(value, reward, policy_logits, reconstruction, hidden_state)]
         for i in range(1, action_batch.shape[1]):
             value, reward, policy_logits, hidden_state, reconstruction = self.model.recurrent_inference(
                 hidden_state, action_batch[:, i]
             )
+                            
+            current_state_flat = hidden_state.view(batch_size, -1)
+
+            target_state_flat = target_latent_states[:, i]
+            
+            current_consistency_loss = torch.nn.functional.mse_loss(
+                current_state_flat, target_state_flat
+            )
+
+            current_consistency_loss.register_hook(
+                lambda grad: grad / gradient_scale_batch[:, i]
+            )
+            
+            consistency_loss += current_consistency_loss
+
             # Scale the gradient at the start of the dynamics function (See paper appendix Training)
             hidden_state.register_hook(lambda grad: grad * 0.5)
-            predictions.append((value, reward, policy_logits, reconstruction))
+            predictions.append((value, reward, policy_logits, reconstruction, hidden_state))
         # predictions: num_unroll_steps+1, 3, batch, 2*support_size+1 | 2*support_size+1 | 9 (according to the 2nd dim)
 
         ## Compute losses
@@ -274,6 +304,7 @@ class Trainer:
             + reward_loss 
             + policy_loss 
             + reconstruction_loss * self.config.reconstruction_loss_weight
+            + consistency_loss * self.config.consistency_loss_weight
         )
         
         if self.config.PER:
