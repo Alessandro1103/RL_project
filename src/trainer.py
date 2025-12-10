@@ -214,8 +214,9 @@ class Trainer:
         policy_loss += current_policy_loss
 
         current_reconstruction_loss = torch.nn.functional.mse_loss(
-            reconstruction, target_observations[:, 0]
+            reconstruction, target_observations[:, 0], reduction='none'
         )
+        current_reconstruction_loss = current_reconstruction_loss.view(batch_size, -1).mean(dim=1)
         reconstruction_loss += current_reconstruction_loss
 
         # Compute priorities for the prioritized replay (See paper appendix Training)
@@ -247,7 +248,8 @@ class Trainer:
             )
 
             # Scale gradient by the number of unroll steps (See paper appendix Training)
-            scale = gradient_scale_batch[:, i].view(-1, 1)
+            # FIX: Removed .view(-1, 1) so scale stays (batch_size,) matching the losses
+            scale = gradient_scale_batch[:, i]
             
             current_value_loss.register_hook(
                 lambda grad, s=scale: grad / s
@@ -264,8 +266,9 @@ class Trainer:
             policy_loss += current_policy_loss
 
             current_reconstruction_loss = torch.nn.functional.mse_loss(
-                reconstruction, target_observations[:, i]
+                reconstruction, target_observations[:, i], reduction='none'
             )
+            current_reconstruction_loss = current_reconstruction_loss.view(batch_size, -1).mean(dim=1)
             
             current_reconstruction_loss.register_hook(
                 lambda grad, s=scale: grad / s
@@ -277,8 +280,10 @@ class Trainer:
             target_state_flat = target_latent_states[:, i]
             
             current_consistency_loss = torch.nn.functional.mse_loss(
-                current_state_flat, target_state_flat
+                current_state_flat, target_state_flat, reduction='none'
             )
+            current_consistency_loss = current_consistency_loss.view(batch_size, -1).mean(dim=1)
+
             current_consistency_loss.register_hook(
                 lambda grad, s=scale: grad / s
             )
