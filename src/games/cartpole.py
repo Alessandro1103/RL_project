@@ -76,13 +76,13 @@ class MuZeroConfig:
         self.save_model = True  # Save the checkpoint in results_path as model.checkpoint
         self.training_steps = 10000  # Total number of training steps (ie weights update according to a batch)
         self.self_supervised_steps = 0  # Total number of self-supervised pre-training steps
-        self.batch_size = 64  # Number of parts of games to train on at each training step
+        self.batch_size = 128  # Number of parts of games to train on at each training step
         self.checkpoint_interval = 10  # Number of training steps before using the model for self-playing
         # Scale the value loss to avoid overfitting of the value function, paper recommends 0.25 (See paper appendix Reanalyze)
         self.value_loss_weight = 1
-        self.reconstruction_loss_weight = 1
-        self.consistency_loss_weight = 1
-        self.train_on_gpu = False
+        self.reconstruction_loss_weight = 0.5
+        self.consistency_loss_weight = 0.5
+        self.train_on_gpu = True if torch.cuda.is_available() else False  # Train on GPU if available
 
         self.optimizer = "Adam"  # "Adam" or "SGD". Paper uses SGD
         self.weight_decay = 1e-4  # L2 weights regularization
@@ -94,7 +94,7 @@ class MuZeroConfig:
         self.lr_decay_steps = 1000
 
         # Replay Buffer
-        self.replay_buffer_size = 200  # Number of self-play games to keep in the replay buffer
+        self.replay_buffer_size = 500  # Number of self-play games to keep in the replay buffer
         self.num_unroll_steps = 10  # Number of game moves to keep for every batch element
         self.td_steps = 50  # Number of steps in the future to take into account for calculating the target value
         # Prioritized Replay (See paper appendix Training), select in priority the elements in the replay buffer which are unexpected for the network
