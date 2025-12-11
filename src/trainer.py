@@ -70,6 +70,9 @@ class Trainer:
         ):
             index_batch, batch = ray.get(next_batch)
             next_batch = replay_buffer.get_batch.remote()
+
+            self_supervised = self.training_step < self.config.self_supervised_steps
+
             self.update_lr()
             (
                 priorities,
@@ -77,7 +80,7 @@ class Trainer:
                 value_loss,
                 reward_loss,
                 policy_loss,
-            ) = self.update_weights(batch)
+            ) = self.update_weights(batch, self_supervised)
 
             if self.config.PER:
                 # Save new priorities in the replay buffer (See https://arxiv.org/abs/1803.00933)
@@ -121,7 +124,7 @@ class Trainer:
                 ):
                     time.sleep(0.5)
 
-    def update_weights(self, batch):
+    def update_weights(self, batch, self_supervised):
         """
         Perform one training step.
         """
@@ -303,13 +306,21 @@ class Trainer:
             )
 
         # Scale the value loss, paper recommends by 0.25 (See paper appendix Reanalyze)
-        loss = (
-            value_loss * self.config.value_loss_weight 
-            + reward_loss 
-            + policy_loss 
-            + reconstruction_loss * self.config.reconstruction_loss_weight
-            + consistency_loss * self.config.consistency_loss_weight
-        )
+        if self_supervised:
+            # During the pre-training, use ONLY reconstruction and consistency
+            loss = (
+                reconstruction_loss * self.config.reconstruction_loss_weight
+                + consistency_loss * self.config.consistency_loss_weight
+            )
+        else:
+            # Normal training with all the elements
+            loss = (
+                value_loss * self.config.value_loss_weight 
+                + reward_loss 
+                + policy_loss 
+                + reconstruction_loss * self.config.reconstruction_loss_weight
+                + consistency_loss * self.config.consistency_loss_weight
+            )
         
         if self.config.PER:
             # Correct PER bias by using importance-sampling (IS) weights
