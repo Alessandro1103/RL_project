@@ -671,7 +671,7 @@ if __name__ == "__main__":
                 choice = input("Invalid input, enter a number listed above: ")
             choice = int(choice)
             if choice == 0:
-                muzero.train()
+                muzero.train(log_in_tensorboard=False)
             elif choice == 1:
                 load_model_menu(muzero, game_name)
             elif choice == 2:
