@@ -110,6 +110,10 @@ class MuZero:
             "value_loss": 0,
             "reward_loss": 0,
             "policy_loss": 0,
+            "reconstruction_loss": 0,
+            "consistency_loss": 0,
+            "reward_prediction_error": 0,
+            "value_prediction_error": 0,
             "num_played_games": 0,
             "num_played_steps": 0,
             "num_reanalysed_games": 0,
@@ -259,6 +263,10 @@ class MuZero:
             "value_loss",
             "reward_loss",
             "policy_loss",
+            "reconstruction_loss",
+            "consistency_loss",
+            "reward_prediction_error",
+            "value_prediction_error",
             "num_played_games",
             "num_played_steps",
             "num_reanalysed_games",
@@ -320,6 +328,20 @@ class MuZero:
                 writer.add_scalar("3.Loss/Value_loss", info["value_loss"], counter)
                 writer.add_scalar("3.Loss/Reward_loss", info["reward_loss"], counter)
                 writer.add_scalar("3.Loss/Policy_loss", info["policy_loss"], counter)
+                writer.add_scalar("3.Loss/Reconstruction_loss", info["reconstruction_loss"], counter)
+                writer.add_scalar("3.Loss/Consistency_loss", info["consistency_loss"], counter)
+
+                reward_error = info["reward_prediction_error"]
+                value_error = info["value_prediction_error"]
+
+                if isinstance(reward_error, list):
+                    writer.add_scalar("4.Debug/Reward_prediction_error_mean", numpy.mean(reward_error), counter)
+                    writer.add_scalar("4.Debug/Reward_prediction_error_step_1", reward_error[0], counter)
+                
+                if isinstance(value_error, list):
+                    writer.add_scalar("4.Debug/Value_prediction_error_mean", numpy.mean(value_error), counter)
+                    writer.add_scalar("4.Debug/Value_prediction_error_step_0", value_error[0], counter)
+                
                 print(
                     f'Last test reward: {info["total_reward"]:.2f}. Training step: {info["training_step"]}/{self.config.training_steps}. Played games: {info["num_played_games"]}. Loss: {info["total_loss"]:.2f}',
                     end="\r",

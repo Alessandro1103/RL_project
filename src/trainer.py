@@ -80,6 +80,10 @@ class Trainer:
                 value_loss,
                 reward_loss,
                 policy_loss,
+                reconstruction_loss,
+                consistency_loss,
+                reward_prediction_error,
+                value_prediction_error,
             ) = self.update_weights(batch, self_supervised)
 
             if self.config.PER:
@@ -106,6 +110,10 @@ class Trainer:
                     "value_loss": value_loss,
                     "reward_loss": reward_loss,
                     "policy_loss": policy_loss,
+                    "reconstruction_loss": reconstruction_loss,
+                    "consistency_loss": consistency_loss,
+                    "reward_prediction_error": reward_prediction_error,
+                    "value_prediction_error": value_prediction_error,
                 }
             )
 
@@ -203,6 +211,11 @@ class Trainer:
 
         ## Compute losses
         value_loss, reward_loss, policy_loss, reconstruction_loss, consistency_loss = (0, 0, 0, 0, 0)
+        
+        # Track prediction errors for monitoring
+        reward_prediction_errors = []
+        value_prediction_errors = []
+        
         value, reward, policy_logits, reconstruction, _ = predictions[0]
         # Ignore reward loss for the first batch step
         current_value_loss, _, current_policy_loss = self.loss_function(
@@ -234,6 +247,9 @@ class Trainer:
             numpy.abs(pred_value_scalar - target_value_scalar[:, 0])
             ** self.config.PER_alpha
         )
+        
+        # Track initial step prediction error
+        value_prediction_errors.append(current_value_loss.mean().item())
 
         for i in range(1, len(predictions)):
             value, reward, policy_logits, reconstruction, current_hidden_state = predictions[i]
@@ -249,6 +265,10 @@ class Trainer:
                 target_reward[:, i],
                 target_policy[:, i],
             )
+
+            # Track prediction errors BEFORE gradient scaling
+            reward_prediction_errors.append(current_reward_loss.mean().item())
+            value_prediction_errors.append(current_value_loss.mean().item())
 
             # Scale gradient by the number of unroll steps (See paper appendix Training)
             # FIX: Removed .view(-1, 1) so scale stays (batch_size,) matching the losses
@@ -341,6 +361,10 @@ class Trainer:
             value_loss.mean().item(),
             reward_loss.mean().item(),
             policy_loss.mean().item(),
+            reconstruction_loss.mean().item(),
+            consistency_loss.mean().item(),
+            reward_prediction_errors,
+            value_prediction_errors,
         )
 
     def update_lr(self):

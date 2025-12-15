@@ -74,14 +74,14 @@ class MuZeroConfig:
         self.results_path = pathlib.Path(os.path.join(os.path.dirname(os.path.realpath(__file__)), "../results", os.path.basename(__file__)[
                                          :-3], datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")))  # Path to store the model weights and TensorBoard logs
         self.save_model = True  # Save the checkpoint in results_path as model.checkpoint
-        self.training_steps = 10000  # Total number of training steps (ie weights update according to a batch)
-        self.self_supervised_steps = 0  # Total number of self-supervised pre-training steps
+        self.training_steps = 15000  # Total number of training steps (ie weights update according to a batch)
+        self.self_supervised_steps = 5000  # Total number of self-supervised pre-training steps
         self.batch_size = 128  # Number of parts of games to train on at each training step
         self.checkpoint_interval = 10  # Number of training steps before using the model for self-playing
         # Scale the value loss to avoid overfitting of the value function, paper recommends 0.25 (See paper appendix Reanalyze)
         self.value_loss_weight = 1
-        self.reconstruction_loss_weight = 0.5
-        self.consistency_loss_weight = 0.5
+        self.reconstruction_loss_weight = 1
+        self.consistency_loss_weight = 1
         self.train_on_gpu = True if torch.cuda.is_available() else False  # Train on GPU if available
 
         self.optimizer = "Adam"  # "Adam" or "SGD". Paper uses SGD
@@ -110,8 +110,6 @@ class MuZeroConfig:
         self.self_play_delay = 0  # Number of seconds to wait after each played game
         self.training_delay = 0  # Number of seconds to wait after each training step
         self.ratio = 1.5  # Desired training steps per self played step ratio. Equivalent to a synchronous version, training can take much longer. Set it to None to disable it
-
-        self.self_supervised_steps = 1000
 
     def visit_softmax_temperature_fn(self, trained_steps):
         """
