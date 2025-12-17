@@ -1,21 +1,28 @@
 import math
 import sys
-from gym.utils import seeding, EzPickle
-from gym import spaces
-from Box2D.b2 import (
-    edgeShape,
-    circleShape,
-    fixtureDef,
-    polygonShape,
-    revoluteJointDef,
-    contactListener,
-)
-import Box2D
+
+try:
+    from Box2D.b2 import (
+        edgeShape,
+        circleShape,
+        fixtureDef,
+        polygonShape,
+        revoluteJointDef,
+        contactListener,
+    )
+    import Box2D
+except ImportError:
+    print("Box2D non trovato. Installalo con: pip install gymnasium[box2d]")
+    pass
+
 import numpy as np
 import datetime
 import os
+import pathlib
 
-import gym
+import gymnasium as gym
+from gymnasium import spaces              
+from gymnasium.utils import seeding, EzPickle 
 import numpy
 import torch
 
@@ -84,8 +91,12 @@ class MuZeroConfig:
         self.fc_policy_layers = [64]  # Define the hidden layers in the policy network
 
         # Training
-        self.results_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "../results", os.path.basename(__file__)[
-                                         :-3], datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S"))  # Path to store the model weights and TensorBoard logs
+        self.results_path = pathlib.Path(os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), 
+            "../results", 
+            os.path.basename(__file__)[:-3], 
+            datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
+        ))
         self.save_model = True  # Save the checkpoint in results_path as model.checkpoint
         self.training_steps = 30000  # Total number of training steps (ie weights update according to a batch)
         self.self_supervised_steps = 0  # Total number of self-supervised pre-training steps
@@ -143,9 +154,7 @@ class Game(AbstractGame):
 
     def __init__(self, seed=None):
         self.env = DeterministicLunarLander()
-        # self.env = gym.make("LunarLander-v2")
-        if seed is not None:
-            self.env.seed(seed)
+        self.env_seed = seed
 
     def step(self, action):
         """
@@ -157,7 +166,8 @@ class Game(AbstractGame):
         Returns:
             The new observation, the reward and a boolean if the game has ended.
         """
-        observation, reward, done, _ = self.env.step(action)
+        observation, reward, terminated, truncated, _ = self.env.step(action)
+        done = terminated or truncated
         return numpy.array([[observation]]), reward / 3, done
 
     def legal_actions(self):
@@ -180,7 +190,8 @@ class Game(AbstractGame):
         Returns:
             Initial observation of the game.
         """
-        return numpy.array([[self.env.reset()]])
+        observation, _ = self.env.reset(seed=self.env_seed)
+        return numpy.array([[observation]])
 
     def close(self):
         """
@@ -297,19 +308,17 @@ class DeterministicLunarLander(gym.Env, EzPickle):
 
         # useful range is -1 .. +1, but spikes can be higher
         self.observation_space = spaces.Box(
-            -np.inf, np.inf, shape=(8,), dtype=np.float32
+            -numpy.inf, numpy.inf, shape=(8,), dtype=numpy.float32
         )
 
         if self.continuous:
             # Action is two floats [main engine, left-right engines].
             # Main engine: -1..0 off, 0..+1 throttle from 50% to 100% power. Engine can't work with less than 50% power.
             # Left-right:  -1.0..-0.5 fire left engine, +0.5..+1.0 fire right engine, -0.5..0.5 off
-            self.action_space = spaces.Box(-1, +1, (2,), dtype=np.float32)
+            self.action_space = spaces.Box(-1, +1, (2,), dtype=numpy.float32)
         else:
             # Nop, fire left engine, main engine, right engine
             self.action_space = spaces.Discrete(4)
-
-        self.reset()
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
@@ -327,7 +336,8 @@ class DeterministicLunarLander(gym.Env, EzPickle):
         self.world.DestroyBody(self.legs[0])
         self.world.DestroyBody(self.legs[1])
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
         self._destroy()
         self.world.contactListener_keepref = ContactDetector(self)
         self.world.contactListener = self.world.contactListener_keepref
@@ -431,7 +441,8 @@ class DeterministicLunarLander(gym.Env, EzPickle):
 
         self.drawlist = [self.lander] + self.legs
 
-        return self.step(np.array([0, 0]) if self.continuous else 0)[0]
+        obs = self.step(0)[0]
+        return obs, {}
 
     def _create_particle(self, mass, x, y, ttl):
         p = self.world.CreateDynamicBody(
@@ -569,17 +580,26 @@ class DeterministicLunarLander(gym.Env, EzPickle):
         )  # less fuel spent is better, about -30 for heuristic landing
         reward -= s_power * 0.03
 
-        done = False
+        terminated = False # "done" diventa "terminated"
         if self.game_over or abs(state[0]) >= 1.0:
-            done = True
+            terminated = True
             reward = -100
         if not self.lander.awake:
-            done = True
+            terminated = True
             reward = +100
-        return np.array(state, dtype=np.float32), reward, done, {}
+
+        truncated = False
+
+        return numpy.array(state, dtype=numpy.float32), reward, terminated, truncated, {}
 
     def render(self, mode="human"):
-        from gym.envs.classic_control import rendering
+        try:
+            from gymnasium.envs.classic_control import rendering
+        except ImportError:
+            # Fallback se non siamo in modalità visuale
+            if mode == "rgb_array":
+                return numpy.zeros((VIEWPORT_H, VIEWPORT_W, 3), dtype=numpy.uint8)
+            return
 
         if self.viewer is None:
             self.viewer = rendering.Viewer(VIEWPORT_W, VIEWPORT_H)

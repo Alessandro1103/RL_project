@@ -2,7 +2,17 @@ import os
 import glob
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import rcParams
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+# Configurazione stile matplotlib
+rcParams['font.family'] = 'serif'
+rcParams['font.size'] = 14
+rcParams['axes.linewidth'] = 1.5
+rcParams['xtick.major.width'] = 1.5
+rcParams['ytick.major.width'] = 1.5
+rcParams['xtick.major.size'] = 6
+rcParams['ytick.major.size'] = 6
 
 LOG_DIRS = {
     'MuZero (Baseline)': 'results/cartpole/1_Baseline',        
@@ -14,16 +24,16 @@ LOG_DIRS = {
 
 DISPLAY_LABELS = {
     'MuZero (Baseline)': 'MuZero',
-    'Reconstruction': r'$l^g$',           # l^g
-    'Consistency': r'$l^c$',              # l^c
-    'Hybrid': r'$l^g + l^c$',             # l^g + l^c
-    'Hybrid+Pre': r'$l^g + l^c$ (pre)'    # l^g + l^c pre
+    'Reconstruction': r'$l^g$',
+    'Consistency': r'$l^c$',
+    'Hybrid': r'$l^g + l^c$',
+    'Hybrid+Pre': r'$l^g + l^c$ $pre$'
 }
 
 COLORS = {
     'MuZero (Baseline)': 'black',
     'Reconstruction': 'blue',
-    'Consistency': 'green',
+    'Consistency': 'red',
     'Hybrid': 'cyan',
     'Hybrid+Pre': 'red'
 }
@@ -93,10 +103,10 @@ def get_data(folder_path, skip_steps=0, rescale=False):
     return common_x, mean_y, std_y
 
 def create_plot(experiment_list, title, filename):
-
     os.makedirs(PLOT_OUTPUT_DIR, exist_ok=True)
     
-    plt.figure(figsize=(10, 6))
+    # Figura quadrata
+    fig, ax = plt.subplots(figsize=(8, 8))
     
     found_data = False
     for key in experiment_list:
@@ -113,29 +123,51 @@ def create_plot(experiment_list, title, filename):
         if x is not None and len(x) > 0:
             found_data = True
             mask = x <= 10000
-            x_filt = x[mask]
+            x_filt = x[mask] / 10000  # Scala a 0-1
             y_filt = mean_y[mask]
             
             display_label = DISPLAY_LABELS.get(key, key)
             color = COLORS.get(key, 'gray')
-
-            # PLOT DELLA MEDIA
-            plt.plot(x_filt, y_filt, 
-                     color=color, 
-                     label=display_label, 
-                     linewidth=1)
+            
+            # Plot con linee più spesse
+            ax.plot(x_filt, y_filt, 
+                    color=color, 
+                    label=display_label, 
+                    linewidth=2.5)
         else:
             print(f"No valid data for {key}")
 
     if found_data:
-        plt.xlabel('Training Steps', fontsize=12)
-        plt.ylabel('Total Reward (Mean)', fontsize=12)
-        plt.title("Cartpole-v1", fontsize=12)
+        # Griglia più marcata
+        ax.grid(True, alpha=0.4, linewidth=1, color='gray')
         
-        plt.legend(loc='upper left', fontsize=12, frameon=True)
+        # Assi con frecce
+        ax.spines['left'].set_position('zero')
+        ax.spines['bottom'].set_position('zero')
+        ax.spines['right'].set_color('none')
+        ax.spines['top'].set_color('none')
         
-        plt.grid(True, alpha=0.3)
-        plt.xlim(0, 10000)
+        # Frecce agli assi
+        ax.plot(1, 0, ">k", transform=ax.get_yaxis_transform(), clip_on=False, markersize=8)
+        ax.plot(0, 1, "^k", transform=ax.get_xaxis_transform(), clip_on=False, markersize=8)
+        
+        # Labels
+        ax.set_xlabel('Training steps' + r'      $\cdot 10^4$', fontsize=16, loc='right')
+        ax.set_ylabel('Total reward', fontsize=16, rotation=90, loc='top')
+        
+        # Titolo
+        ax.set_title('CartPole-v1', fontsize=18, pad=20)
+        
+        # Legenda con bordo
+        ax.legend(loc='lower right', fontsize=14, frameon=True, 
+                 edgecolor='black', fancybox=False, shadow=False)
+        
+        # Limiti
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, None)
+        
+        # Tick personalizzati
+        ax.set_xticks([0, 0.2, 0.4, 0.6, 0.8, 1.0])
         
         plt.tight_layout()
         
@@ -178,28 +210,26 @@ def print_stats():
 if __name__ == "__main__":
     print_stats()
     
-    group1 = ['MuZero (Baseline)', 'Reconstruction', 'Hybrid']
+    # Plot 1: MuZero vs l^c
+    group1 = ['MuZero (Baseline)', 'Consistency']
     create_plot(group1, 
-                "Comparison: Baseline vs Reconstruction vs Hybrid", 
-                "comparison_baseline_reconstruction_hybrid.png")
+                "MuZero vs Consistency", 
+                "muzero_vs_consistency.png")
     
-    group2 = ['MuZero (Baseline)', 'Consistency', 'Hybrid']
+    # Plot 2: MuZero vs l^g
+    group2 = ['MuZero (Baseline)', 'Reconstruction']
     create_plot(group2,
-                "Comparison: Baseline vs Consistency vs Hybrid", 
-                "comparison_baseline_concistency_hybrid.png")
+                "MuZero vs Reconstruction", 
+                "muzero_vs_reconstruction.png")
     
-    group3 = ['MuZero (Baseline)', 'Hybrid', 'Hybrid+Pre']
+    # Plot 3: MuZero vs l^g vs l^g+l^c
+    group3 = ['MuZero (Baseline)', 'Reconstruction', 'Hybrid']
     create_plot(group3, 
-                "Comparison: Baseline vs Hybrid vs Pre-trained", 
-                "comparison_baseline_hybrid_pre.png")
-
-    group_all = [
-        'MuZero (Baseline)', 
-        'Reconstruction', 
-        'Consistency', 
-        'Hybrid', 
-        'Hybrid+Pre'
-    ]
-    create_plot(group_all, 
-                "Comparison: All Experiments", 
-                "comparison_all.png")
+                "MuZero vs Reconstruction vs Hybrid", 
+                "muzero_vs_reconstruction_vs_hybrid.png")
+    
+    # Plot 4: MuZero vs l^g+l^c vs l^g+l^c pre
+    group4 = ['MuZero (Baseline)', 'Hybrid', 'Hybrid+Pre']
+    create_plot(group4, 
+                "MuZero vs Hybrid vs Hybrid Pre-trained", 
+                "muzero_vs_hybrid_vs_pre.png")
